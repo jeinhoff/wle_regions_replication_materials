@@ -1,0 +1,231 @@
+---
+title: '03_estimation'
+---
+
+```{r setup}
+# Load packages
+library(tidyverse)
+library(eurostat)
+library(sf)
+library(giscoR)
+
+# Empty work space
+rm(list = ls()) 
+
+# Avoid scientific notation
+options(scipen = 999)
+
+# Set seed
+set.seed(123)
+
+```
+
+```{r}
+# life tables from 00_download_data
+load("data/life_tables.RData")
+stopifnot(!all(is.na(life_tables_national$surv_prob_national)))
+
+emp_files <- list.files(path = "outputs/bootstraps", pattern = "^emp_.*\\.rds$",   full.names = T)
+hours_files <- list.files(path = "outputs/bootstraps", pattern = "^hours_.*\\.rds$", full.names = T)
+
+stopifnot(length(emp_files) > 0, length(hours_files) > 0)
+message("reading ", length(emp_files), " employment and ",
+        length(hours_files), " working-hours bootstrap files")
+
+# read bootstrap files
+read_bootstrap <- function(f) readRDS(f) |> mutate(across(where(is.factor), as.character))
+
+est_emp   <- emp_files   |> map(read_bootstrap) |> list_rbind()
+est_hours <- hours_files |> map(read_bootstrap) |> list_rbind()
+
+estimates_combined <- est_emp |>
+  left_join(est_hours, by = c("country_code_3d", "region", "year_binned", "sex", "age_bracket", "bs_iteration")) |>
+  left_join(life_tables_national, by = c("country_code_3d", "year_binned", "sex", "age_bracket" =  "age")) |>
+  left_join(life_tables_regional, by = c("region", "year_binned", "sex", "age_bracket" =  "age"))
+
+# drop codes that duplicate territory covered by other codes (FI1B_FI1C, IE, BG31-BG42, HU1)
+estimates_combined <- estimates_combined |>
+  filter(!region %in% c("FI1B", "FI1C", "IE04", "IE05", "IE06",
+                        "BG3", "BG4", "HU11", "HU12"))
+
+estimates_combined <- estimates_combined |> filter(bs_iteration <= 250)
+
+nuts0 <- get_eurostat_geospatial(nuts_level = 0, year = 2021)
+
+nuts0 <- nuts0 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+nuts1 <- get_eurostat_geospatial(nuts_level = 1, year = 2021)
+
+nuts1 <- nuts1 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+nuts2 <- get_eurostat_geospatial(nuts_level = 2, year = 2021)
+
+nuts2 <- nuts2 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+regions <- rbind(nuts0, nuts1, nuts2)
+
+# geometries of combined regions
+merged_codes <- unique(estimates_combined$region[grepl("_", estimates_combined$region)])
+
+merged_regions <- lapply(merged_codes, function(code) {
+  parts <- strsplit(code, "_")[[1]]
+  sub   <- regions[regions$NUTS_ID %in% parts, ]
+  if (nrow(sub) < length(parts)) {
+    warning("No geometry found for all parts of ", code)
+    return(NULL)
+  }
+  out <- tibble(
+    NUTS_ID     = code,
+    region_name = paste(sub$region_name, collapse = " and "))
+  out$geometry <- sf::st_union(sf::st_make_valid(sub$geometry))
+  out
+})
+
+regions <- rbind(regions, do.call(rbind, merged_regions))
+
+estimates_combined <- estimates_combined |>
+  left_join(regions, by = c("region" = "NUTS_ID"))
+
+pop_size_regional <- get_eurostat("demo_r_d2jan", time_format = "num") |>
+  filter(age == "TOTAL", sex == "T") |>
+  transmute(
+    region = geo,
+    year   = TIME_PERIOD,
+    pop_size_regional = values) |>
+  mutate(year_binned = case_when(
+    year %in% 2000:2004 ~ "2000-04",
+    year %in% 2005:2009 ~ "2005-09",
+    year %in% 2010:2014 ~ "2010-14",
+    year %in% 2015:2019 ~ "2015-19",
+    year %in% 2020:2024 ~ "2020-24")) |>
+  filter(!is.na(year_binned)) |>
+  group_by(region, year_binned) |>
+  summarise(pop_size_regional = mean(pop_size_regional, na.rm = TRUE), .groups = "drop")
+
+# population of combined regions
+pop_merged <- lapply(merged_codes, function(code) {
+  parts <- strsplit(code, "_")[[1]]
+  pop_size_regional |>
+    filter(region %in% parts) |>
+    group_by(year_binned) |>
+    summarise(pop_size_regional = sum(pop_size_regional, na.rm = TRUE), .groups = "drop") |>
+    mutate(region = code)
+}) |> bind_rows()
+
+pop_size_regional <- bind_rows(pop_size_regional, pop_merged)
+
+estimates_combined <- estimates_combined |>
+  left_join(pop_size_regional, by = c("region", "year_binned"))
+
+estimates_combined <- estimates_combined |> 
+  group_by(country_code_3d, region, year_binned, sex, age_bracket, bs_iteration) |>
+  slice(1) |>
+  ungroup()
+
+rm(list = setdiff(ls(), c("estimates_combined")))
+
+```
+
+```{r}
+estimates_wle_bs <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, bs_iteration) |>
+  mutate(
+    wle_1 = sum(prev),
+    wle_2 = sum(prev * hours),
+    wle_3 = sum(prev * surv_prob_national),
+    wle_4 = sum(prev * surv_prob_regional),
+    wle_5 = sum(prev * hours * surv_prob_national),
+    wle_6 = sum(prev * hours * surv_prob_regional)) |>
+  filter(age_bracket == 50) |>
+  select(country_code_3d, region, region_name, year_binned, sex, bs_iteration, ex_national, ex_regional, pop_size_regional, wle_1, wle_2, wle_3, wle_4, wle_5, wle_6, geometry)
+
+estimates_wle <- estimates_wle_bs |>
+  group_by(country_code_3d, region, year_binned, sex) |>
+  summarise(
+    # point estimate: bootstrap mean; 95% percentile intervals
+    wle_1_est = mean(wle_1, na.rm = T), wle_1_low = quantile(wle_1, 0.025, na.rm = T), wle_1_upp = quantile(wle_1, 0.975, na.rm = T),
+    wle_2_est = mean(wle_2, na.rm = T), wle_2_low = quantile(wle_2, 0.025, na.rm = T), wle_2_upp = quantile(wle_2, 0.975, na.rm = T),
+    wle_3_est = mean(wle_3, na.rm = T), wle_3_low = quantile(wle_3, 0.025, na.rm = T), wle_3_upp = quantile(wle_3, 0.975, na.rm = T),
+    wle_4_est = mean(wle_4, na.rm = T), wle_4_low = quantile(wle_4, 0.025, na.rm = T), wle_4_upp = quantile(wle_4, 0.975, na.rm = T),
+    wle_5_est = mean(wle_5, na.rm = T), wle_5_low = quantile(wle_5, 0.025, na.rm = T), wle_5_upp = quantile(wle_5, 0.975, na.rm = T),
+    wle_6_est = mean(wle_6, na.rm = T), wle_6_low = quantile(wle_6, 0.025, na.rm = T), wle_6_upp = quantile(wle_6, 0.975, na.rm = T),
+    ex_national = first(ex_national), 
+    ex_regional = first(ex_regional),
+    region_name = first(region_name),
+    pop_size_regional = first(pop_size_regional),
+    geometry = first(geometry),
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, ex_national, ex_regional, pop_size_regional, wle_1_est, wle_1_low, wle_1_upp, wle_2_est, wle_2_low, wle_2_upp, wle_3_est, wle_3_low, wle_3_upp, wle_4_est, wle_4_low, wle_4_upp, wle_5_est, wle_5_low, wle_5_upp, wle_6_est, wle_6_low, wle_6_upp, geometry)
+
+```
+
+```{r}
+estimates_emp_rate_bs <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, age_bracket, bs_iteration) |>
+  summarise(
+    age = age_bracket,
+    emp_rate = prev,
+    region_name = region_name,
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, age, bs_iteration, emp_rate)
+
+estimates_emp_rate <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, age_bracket) |>
+  summarise(
+    age = first(age_bracket),
+    emp_rate = mean(prev, na.rm = T), emp_rate_low = quantile(prev, 0.025, na.rm = T), emp_rate_upp = quantile(prev, 0.975, na.rm = T),
+    region_name = first(region_name),
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, age, emp_rate, emp_rate_low, emp_rate_upp)
+
+```
+
+```{r}
+estimates_hours_bs <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, age_bracket, bs_iteration) |>
+  summarise(
+    age = age_bracket,
+    hours = hours,
+    region_name = region_name,
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, age, bs_iteration, hours)
+
+estimates_hours <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, age_bracket) |>
+  summarise(
+    age = first(age_bracket),
+    hours_est = mean(hours, na.rm = T), hours_low = quantile(hours, 0.025, na.rm = T), hours_upp = quantile(hours, 0.975, na.rm = T),
+    region_name = first(region_name),
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, age, hours_est, hours_low, hours_upp)
+
+```
+
+```{r}
+estimates_survival <- estimates_combined |>
+  group_by(country_code_3d, region, year_binned, sex, age_bracket) |>
+  summarise(
+    age = first(age_bracket),
+    surv_prob_national = first(surv_prob_national),
+    surv_prob_regional = first(surv_prob_regional),
+    region_name = first(region_name),
+    .groups = "drop") |>
+  select(country_code_3d, region, region_name, year_binned, sex, age, surv_prob_national, surv_prob_regional)
+
+```
+
+```{r}
+rm(list = setdiff(ls(), c("estimates_wle", "estimates_wle_bs", "estimates_emp_rate", "estimates_emp_rate_bs", "estimates_hours", "estimates_hours_bs", "estimates_survival", "estimates_combined")))
+
+save.image("outputs/final_estimates.RData")
+
+```

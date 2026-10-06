@@ -1,0 +1,282 @@
+---
+title: '04_descriptives'
+---
+
+```{r setup}
+library(tidyverse)
+library(openxlsx)
+library(eurostat)
+library(giscoR)
+library(sf)
+library(rnaturalearth)
+
+rm(list = ls())
+
+options(scipen = 999)
+
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+
+load("outputs/final_estimates.RData")
+
+```
+
+# Tab. 1: levels and gaps
+```{r}
+# Highest/lowest by sex
+tab2 <- estimates_wle |> select(-any_of(c("geometry", "ex_national", "ex_regional"))) |>
+  mutate(
+    note = ifelse(is.na(wle_6_est), "aWLE adjusted for national mortality", "aWLE adjusted for regional mortality"),
+    est_lower = round(coalesce(wle_6_low, wle_5_low), 2),
+    est = round(coalesce(wle_6_est, wle_5_est), 2),
+    est_upper = round(coalesce(wle_6_upp, wle_5_upp), 2)) |>
+  select(country_code_3d, year_binned, region, region_name, sex, est, est_lower, est_upper, note) |>
+  arrange(year_binned, sex, region)
+
+write.xlsx(tab2, "outputs/tables/ranking_levels.xlsx")
+
+# Largest sex differences
+tab3 <- estimates_wle_bs |> select(-any_of("geometry")) |>
+  mutate(wle = coalesce(wle_6, wle_5)) |>
+  group_by(country_code_3d, region, year_binned, bs_iteration) |>
+  arrange(sex) |>
+  mutate(sex_diff = wle - lag(wle)) |>   # men minus women ("female" sorts first)
+  group_by(country_code_3d, region, region_name, year_binned) |>
+  select(country_code_3d, region, region_name, year_binned, sex_diff) |>
+  summarise(
+    est = round(mean(sex_diff, na.rm = TRUE), 2),
+    est_lower = quantile(sex_diff, 0.025, na.rm = TRUE),
+    est_upper = quantile(sex_diff, 0.975, na.rm = TRUE),
+    sig_95 = ifelse((est_lower < 0 & est_upper < 0) | (est_lower > 0 & est_upper > 0), "*", ""),
+    .groups = "drop") |>
+  select(country_code_3d, year_binned, region, region_name, est, est_lower, est_upper, sig_95) |>
+  arrange(year_binned, region)
+
+write.xlsx(tab3, "outputs/tables/ranking_gaps.xlsx")
+
+```
+
+# Fig. 2: map levels
+```{r}
+rm(list=setdiff(ls(), c("estimates_wle", "estimates_wle_bs")))
+
+nuts0 <- get_eurostat_geospatial(nuts_level = 0, year = 2021)
+
+nuts0 <- nuts0 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+nuts1 <- get_eurostat_geospatial(nuts_level = 1, year = 2021)
+
+nuts1 <- nuts1 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+nuts2 <- get_eurostat_geospatial(nuts_level = 2, year = 2021)
+
+nuts2 <- nuts2 |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry)
+
+world_map <- ne_countries(scale = "small", returnclass = "sf") |> filter(admin %in% c("Russia", "Ukraine", "Belarus", "Moldova", "Bosnia and Herzegovina", "Kosovo"))
+
+uk_map <- get_eurostat_geospatial(nuts_level = 1, year = 2021)
+
+uk_map <- uk_map |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry) |>
+  filter(substr(NUTS_ID, 1, 2) == "UK") |>
+  mutate(year_binned = "2015-19")
+
+data_plot <- estimates_wle |>
+  filter(year_binned == "2020-24") |>
+  mutate(
+    wle_est = coalesce(wle_6_est, wle_5_est),
+    sex     = ifelse(sex == "male", "Men", "Women")
+  )
+
+ggplot(data_plot) +
+  facet_grid(~sex) +
+  geom_sf(data = world_map, aes(geometry = geometry), fill = "grey80", color = "black", linewidth = 0.3) +
+  geom_sf(data = nuts0, aes(geometry = geometry), fill = "grey80", color = "white", linewidth = 0.2) +
+  geom_sf(aes(geometry = geometry, fill = wle_est), color = "white") +
+  geom_sf(data = uk_map, aes(geometry = geometry), fill = "grey50", color = "white", linewidth = 0.2) +
+  geom_sf(data = nuts0, fill = NA, color = "black", linewidth = 0.3, aes(geometry = geometry)) +
+  scale_fill_viridis_b(
+    option = "D",
+    n.breaks = 10,
+    name = "FTE\nyears",
+    na.value = "#f0f0f0",
+    guide = guide_colorsteps(show.limits = TRUE)) +
+  coord_sf(ylim = c(34, 71), xlim = c(-10.5, 32), expand = FALSE) +
+  theme_bw() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.position = "right",
+    legend.key.height = unit(1.5, "cm"),
+    legend.text = element_text(size = 12),
+    strip.text = element_text(size = 14),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA))
+ggsave("outputs/figures/fig2_map.pdf", width = 7.5, height = 5)
+ggsave("outputs/figures/fig2_map.png", width = 7.5, height = 5)
+
+```
+
+# Fig. 3: map changes
+```{r}
+
+uk_map <- get_eurostat_geospatial(nuts_level = 1, year = 2021)
+
+uk_map <- uk_map |>
+  as.data.frame() |>
+  mutate(region_name = str_to_title(NAME_LATN)) |>
+  dplyr::select(NUTS_ID, region_name, geometry) |>
+  filter(substr(NUTS_ID, 1, 2) == "UK") |>
+  mutate(year_binned = "2015-19 to\n2020-24")
+
+data_plot <- estimates_wle |>
+  mutate(wle_est = coalesce(wle_6_est, wle_5_est)) |>
+  group_by(sex, region) |>
+  arrange(year_binned) |>
+  mutate(change = wle_est - lag(wle_est)) |>
+  select(sex, region, year_binned, change, geometry) |>
+  filter(year_binned != "2000-04") |>
+  mutate(sex = ifelse(sex == "male", "Men", "Women"))
+
+data_plot <- data_plot |>
+  mutate(
+    year_binned = case_when(
+      year_binned == "2005-09" ~ "2000-04 to\n2005-09",
+      year_binned == "2010-14" ~ "2005-09 to\n2010-14",
+      year_binned == "2015-19" ~ "2010-14 to\n2015-19",
+      year_binned == "2020-24" ~ "2015-19 to\n2020-24",
+      T ~ NA
+    )
+  )
+
+
+ggplot(data_plot) +
+  facet_grid(sex~year_binned, switch = "y") +
+  geom_sf(data = world_map, aes(geometry = geometry), fill = "grey80", color = "black", linewidth = 0.3) +
+  geom_sf(data = nuts0, aes(geometry = geometry), fill = "grey80", color = "white", linewidth = 0.2) +
+  geom_sf(aes(geometry = geometry, fill = pmax(change, -2)), color = "white") +
+  geom_sf(data = uk_map, aes(geometry = geometry), fill = "grey50", color = "white", linewidth = 0.2) +
+  geom_sf(data = nuts0, fill = NA, color = "black", linewidth = 0.3, aes(geometry = geometry)) +
+  scale_fill_stepsn(
+    colors = c("firebrick", "white", "navyblue"),
+    values = scales::rescale(c(-2.1, 0, 3)),  # places white exactly at 0
+    limits = c(-2.1, 3.2),
+    breaks = seq(-2, 3, 1),
+    name = "Change in\nFTE years") +
+  coord_sf(ylim = c(34, 71), xlim = c(-10.5, 32), expand = FALSE) + # europe
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.key.height = unit(1.5, "cm"),
+    legend.text = element_text(size = 12),
+    strip.text = element_text(size = 14),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA))  
+ggsave("outputs/figures/fig3_change.pdf", width = 9, height = 6.25)
+ggsave("outputs/figures/fig3_change.png", width = 9, height = 6)
+
+```
+
+# Fig. 4: sd
+```{r}
+rm(list=setdiff(ls(), c("estimates_wle", "estimates_wle_bs")))
+
+sd_unweighted <- estimates_wle_bs |>
+  filter(country_code_3d != "GBR") |>
+  mutate(
+    wle = coalesce(wle_6, wle_5),
+    sex = ifelse(sex == "female", "Women", "Men")) |>
+  group_by(sex, year_binned, bs_iteration) |>
+  summarise(sd_unweighted = sqrt(sum((wle - mean(wle))^2) / n())) |>
+  group_by(sex, year_binned) |>
+  summarise(
+    sd_unweighted_high = quantile(sd_unweighted, 0.975, na.rm = TRUE),
+    sd_unweighted_low  = quantile(sd_unweighted, 0.025, na.rm = TRUE),
+    sd_unweighted      = mean(sd_unweighted, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pop_size <- estimates_wle |>
+  ungroup() |>
+  filter(country_code_3d != "GBR") |>
+  select(region, year_binned, pop_size_regional) |>
+  distinct() |>
+  filter(year_binned == "2010-14") |>
+  select(-year_binned)
+
+estimates_wle_bs <- estimates_wle_bs |>
+  select(-pop_size_regional) |>
+  left_join(pop_size, by = "region")
+
+sd_weighted <- estimates_wle_bs |>
+  filter(country_code_3d != "GBR") |>
+  mutate(wle = coalesce(wle_6, wle_5),
+         sex = ifelse(sex == "female", "Women", "Men")) |>
+  group_by(sex, year_binned, bs_iteration) |>
+  mutate(global_mean = weighted.mean(wle, w = pop_size_regional)) |>
+  group_by(sex, year_binned, region, bs_iteration) |>
+  mutate(region_mean = mean(wle)) |>
+  group_by(sex, year_binned, bs_iteration) |>
+  summarise(sd_weighted = sqrt(sum(pop_size_regional * (region_mean - global_mean)^2) / sum(pop_size_regional))) |>
+  group_by(sex, year_binned) |>
+  summarise(
+    sd_weighted_high = quantile(sd_weighted, 0.975, na.rm = TRUE),
+    sd_weighted_low  = quantile(sd_weighted, 0.025, na.rm = TRUE),
+    sd_weighted      = mean(sd_weighted, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# combine weighted and unweighted SD
+sd_plot <- bind_rows(
+  sd_unweighted |>
+    rename(sd = sd_unweighted, low = sd_unweighted_low, high = sd_unweighted_high) |>
+    mutate(type = "Unweighted"),
+  sd_weighted |>
+    rename(sd = sd_weighted, low = sd_weighted_low, high = sd_weighted_high) |>
+    mutate(type = "Weighted by population size")) |>
+  mutate(type = factor(type, levels = c("Unweighted", "Weighted by population size")))
+
+ggplot(sd_plot, aes(x = year_binned, y = sd, group = type, color = sex)) +
+  facet_grid(~sex) +
+
+  geom_line(aes(linetype = type)) +
+  geom_point() +
+  geom_linerange(aes(ymin = low, ymax = high)) +
+
+  scale_y_continuous(breaks = seq(0, 10, 0.1)) +
+  scale_color_manual(values = c("navyblue", "firebrick")) +
+  scale_linetype_manual(values = c("Unweighted" = "dashed", "Weighted by population size" = "solid")) +
+
+  guides(color = "none") +
+
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 10),
+    strip.text      = element_text(size = 12),
+    axis.text.y     = element_text(size = 11),
+    axis.text.x     = element_text(angle = 45, vjust = 1, hjust = 1, size = 11)
+  ) +
+  labs(
+    x = "Period",
+    y = "Standard Deviation"
+  )
+ggsave("outputs/figures/fig4_sd.pdf",    width = 6,   height = 4.9)
+ggsave("outputs/figures/fig4_sd.png", width = 6,   height = 4.9)
+
+```

@@ -1,0 +1,151 @@
+---
+title: '00_download_data'
+---
+
+```{r setup}
+library(tidyverse)
+library(rio)
+library(eurostat)
+
+rm(list = ls())
+
+options(scipen = 999)
+
+```
+
+# national life tables
+```{r}
+life_table_female <- import("data/data_hmd/lt_female/fltper_1x1/fltper_1x1.txt")
+life_table_female$sex <- "female"
+
+life_table_male <- import("data/data_hmd/lt_male/mltper_1x1/mltper_1x1.txt")
+life_table_male$sex <- "male"
+
+life_tables_national <- rbind(life_table_female, life_table_male)
+
+life_tables_national <- life_tables_national |>
+  rename(
+    "country_code_3d" = "PopName",
+    "year" = "Year",
+    "age" = "Age",
+    "qx_national" = "qx",
+    "ex_national" = "ex") |>
+  select("country_code_3d", "year", "sex", "age", "qx_national", "ex_national") |>
+  mutate(
+    age = as.numeric(age),
+    qx_national = as.numeric(qx_national),
+    ex_national = as.numeric(ex_national),
+    country_code_3d = case_when(
+      country_code_3d %in% c("DEUTNP") ~ "DEU",
+      country_code_3d %in% c("FRATNP") ~ "FRA",
+      country_code_3d %in% c("GBR_NP") ~ "GBR",
+      T ~ country_code_3d),
+    year_binned = case_when(
+      year %in% c(2000:2004) ~ "2000-04",
+      year %in% c(2005:2009) ~ "2005-09",
+      year %in% c(2010:2014) ~ "2010-14",
+      year %in% c(2015:2019) ~ "2015-19",
+      year %in% c(2020:2024) ~ "2020-24")) |>
+  filter(age %in% c(50:74) & !is.na(year_binned))
+
+# survival probability relative to age 50
+life_tables_national <- life_tables_national |>
+  group_by(country_code_3d, year, sex) |>
+  arrange(age, .by_group = TRUE) |>
+  mutate(surv_prob_national = lag(cumprod(1 - qx_national), default = 1)) |>
+  group_by(country_code_3d, year_binned, sex, age) |>
+  summarise(
+    surv_prob_national = mean(surv_prob_national, na.rm = T),
+    ex_national = mean(ex_national, na.rm = T),
+    .groups = "drop") |>
+  select(country_code_3d, year_binned, sex, age, surv_prob_national, ex_national)
+
+rm(life_table_female, life_table_male)
+
+```
+
+# regional life tables
+```{r}
+# life tables by age, sex and region (Eurostat demo_r_mlife)
+life_tables_regional <- get_eurostat("demo_r_mlife", time_format = "num",
+                                     filters = list(indic_de = c("PROBDEATH", "LIFEXP")))
+if (!"TIME_PERIOD" %in% names(life_tables_regional)) life_tables_regional <- rename(life_tables_regional, TIME_PERIOD = time)
+
+life_tables_regional <- life_tables_regional |>
+  filter(!age %in% c("Y_LT1", "Y_GE85")) |>
+  mutate(
+    age = as.numeric(gsub("\\D", "", age)),
+    sex = case_when(
+      sex %in% c("F") ~ "female",
+      sex %in% c("M") ~ "male",
+      T ~ NA),
+    region = geo,
+    year = TIME_PERIOD,
+    year_binned = case_when(
+      year %in% c(2000:2004) ~ "2000-04",
+      year %in% c(2005:2009) ~ "2005-09",
+      year %in% c(2010:2014) ~ "2010-14",
+      year %in% c(2015:2019) ~ "2015-19",
+      year %in% c(2020:2024) ~ "2020-24")) |>
+  select(region, year, year_binned, sex, age, indic_de, values) |>
+  pivot_wider(names_from = "indic_de", values_from = "values") |>
+  select(region, year, year_binned, sex, age, PROBDEATH, LIFEXP) |>
+  rename("qx_regional" = "PROBDEATH", "ex_regional" = "LIFEXP") |>
+  filter(age %in% c(50:74) & !is.na(year_binned) & !is.na(sex))
+
+# combined regions: death probabilities of the constituent units, weighted by population at each age
+merged_parts <- c(NO08 = "NO08_NO09_NO0A", NO09 = "NO08_NO09_NO0A", NO0A = "NO08_NO09_NO0A",
+                  PT16 = "PT16_PT18", PT18 = "PT16_PT18",
+                  FI1B = "FI1B_FI1C", FI1C = "FI1B_FI1C")
+n_parts <- table(merged_parts)
+
+pop_parts <- get_eurostat("demo_r_d2jan", time_format = "num",
+                          filters = list(geo = names(merged_parts), sex = c("F", "M"),
+                                         age = paste0("Y", 50:74)))
+if (!"TIME_PERIOD" %in% names(pop_parts)) pop_parts <- rename(pop_parts, TIME_PERIOD = time)
+
+pop_parts <- pop_parts |>
+  transmute(
+    region = geo,
+    year = TIME_PERIOD,
+    sex = ifelse(sex == "F", "female", "male"),
+    age = as.numeric(gsub("\\D", "", age)),
+    pop = values)
+
+life_tables_merged <- life_tables_regional |>
+  filter(region %in% names(merged_parts)) |>
+  left_join(pop_parts, by = c("region", "year", "sex", "age")) |>
+  mutate(region = unname(merged_parts[region])) |>
+  group_by(region, year, year_binned, sex, age) |>
+  summarise(
+    complete = n() == n_parts[[first(region)]] & !anyNA(qx_regional) & !anyNA(pop),
+    qx_regional = if (first(complete)) weighted.mean(qx_regional, pop) else NA_real_,
+    ex_regional = NA_real_,
+    .groups = "drop") |>
+  select(-complete)
+
+life_tables_regional <- life_tables_regional |>
+  filter(!region %in% names(merged_parts)) |>
+  bind_rows(life_tables_merged)
+
+# survival probability relative to age 50
+life_tables_regional <- life_tables_regional |>
+  group_by(region, year, sex) |>
+  arrange(age, .by_group = TRUE) |>
+  mutate(surv_prob_regional = lag(cumprod(1 - qx_regional), default = 1)) |>
+  group_by(region, year_binned, sex, age) |>
+  summarise(
+    surv_prob_regional = mean(surv_prob_regional, na.rm = T),
+    ex_regional = mean(ex_regional, na.rm = T),
+    .groups = "drop") |>
+  select(region, year_binned, sex, age, surv_prob_regional, ex_regional)
+
+```
+
+# save life tables
+```{r}
+dir.create("data", showWarnings = FALSE)
+
+save(life_tables_national, life_tables_regional, file = "data/life_tables.RData")
+
+```

@@ -1,0 +1,228 @@
+---
+title: '02_smoothing'
+---
+
+```{r setup}
+# Load packages
+library(tidyverse)
+library(mgcv)
+library(foreach)
+library(doParallel)
+library(doRNG)
+
+# Empty work space
+rm(list = ls())
+
+# Avoid scientific notation
+options(scipen = 999)
+
+# Load data
+load("data/data_final.RData")
+
+# Set seed
+set.seed(123)
+
+```
+
+```{r}
+
+# --- 1. CONFIGURATION ---
+bs_iterations <- 250
+n_cluster <- 10
+
+if (!dir.exists("outputs/bootstraps")) dir.create("outputs/bootstraps", recursive = TRUE)
+
+# --- 2. DATA PREP ---
+data_lfs <- data_lfs |> mutate(stratum = interaction(country_code_3d, sex, sep = "_", drop = TRUE))
+
+# Define Formulas
+formula_list <- list(
+  "formula_A" = formula("outcome ~ factor(year_binned_region) + s(as.numeric(age_bracket), by = factor(year_binned_region), bs = 'cr', k = 3)"),    # regions and 1-year ages
+  "formula_B" = formula("outcome ~ factor(year_binned) + s(as.numeric(age_bracket), by = factor(year_binned), bs = 'cr', k = 3)"),                  # no regions and 1-year ages
+  "formula_C" = formula("outcome ~ factor(year_binned_region) * factor(age_bracket)"),                                                              # regions and age bins
+  "formula_D" = formula("outcome ~ factor(year_binned) * factor(age_bracket)"))                                                                     # no regions and age bins
+
+# --- DRAW STRATUM ---
+for (j in unique(data_lfs$stratum)) {
+  
+  message(paste("Processing Stratum:", j))
+  data_stratum <- data_lfs |> filter(stratum == j)
+  
+  # formula selection: single years of age or 5-year age bins, one or several regions
+  age_in_single_years <- !all(is.na(data_stratum$age))
+  several_regions     <- n_distinct(data_stratum$region) > 1
+
+  formula_key <-
+    if (several_regions  && age_in_single_years) "formula_A" else
+    if (!several_regions && age_in_single_years) "formula_B" else
+    if (several_regions)                         "formula_C" else
+                                                 "formula_D"
+
+  message(paste("  formula:", formula_key))
+  
+  # 1. PRE-SORT GRIDS
+  if (formula_key %in% c("formula_A", "formula_B")) {
+    pred_grid <- data_stratum |> 
+      select(country_code_3d, region, year_binned, year_binned_region, sex, age_bracket) |> 
+      unique() |>
+      arrange(country_code_3d, region, year_binned, sex, age_bracket) |> 
+      ungroup() |> 
+      group_by(country_code_3d, year_binned_region, region, year_binned, sex) |> 
+      expand(age_bracket = 50:74)
+  }
+  
+  if (formula_key %in% c("formula_C", "formula_D")) {
+    pred_grid <- data_stratum |> 
+      select(country_code_3d, region, year_binned, year_binned_region, sex, age_bracket) |> 
+      unique() |>
+      arrange(country_code_3d, region, year_binned, sex, age_bracket) |> 
+      ungroup() |> 
+      group_by(country_code_3d, year_binned_region, region, year_binned, sex) |> 
+      expand(age_bracket = c("Y50-54", "Y55-59", "Y60-64", "Y65-69", "Y70-74"))
+  }
+
+  # 2. BOOTSTRAP
+  
+  # --- PARALLEL SETUP ---
+  cluster <- makeCluster(n_cluster)
+  registerDoParallel(cluster)
+
+  invisible(foreach(i = 1:bs_iterations, .packages = c("tidyverse", "mgcv")) %dorng% {
+    
+    boot_sample <- data_stratum |>
+      group_by(year) |>
+      slice_sample(prop = 1, replace = TRUE) |>
+      ungroup()
+    
+    # --- MODEL 1: PREVALENCE ---
+    boot_sample$outcome <- ifelse(boot_sample$lm_status == "employed", 1, 0)
+    
+    fit_prev <- bam(
+      formula  = formula_list[[formula_key]],
+      data     = boot_sample,
+      family   = quasibinomial(link = "logit"),
+      method   = "fREML",
+      weights  = weight,
+      nthreads = 1,
+      discrete = F)
+    
+    # Predict
+    vec_prev <- predict(fit_prev, newdata = pred_grid, type = "response")
+    
+    # --- MODEL 2: WORKING HOURS ---
+    boot_sample$outcome <- boot_sample$working_hours_norm
+    
+    fit_hours <- bam(
+      formula  = formula_list[[formula_key]],
+      data     = boot_sample,
+      family   = quasibinomial(link = "logit"),
+      method   = "fREML",
+      weights  = weight,
+      nthreads = 1,
+      discrete = F)
+    
+    # Predict
+    vec_hours <- predict(fit_hours, newdata = pred_grid, type = "response")
+    
+    # --- COMBINE & UNGROUP ---
+    results_iter <- pred_grid
+    results_iter$prev <- vec_prev
+    results_iter$hours <- vec_hours
+    
+    # ungroup if age is not provided in single years
+    if (formula_key %in% c("formula_C", "formula_D")) {
+      
+      # create unique region-year-sex combinations
+      wle_iter_comb <- results_iter |> select(region, year_binned, sex) |> unique()
+
+      ungrouped = data.frame()
+
+      for (k in 1:nrow(wle_iter_comb)) {
+  
+        # retrieve region-year-sex combination
+        comb <- results_iter |> 
+          filter(
+            region == wle_iter_comb$region[k] & 
+            year_binned == wle_iter_comb$year_binned[k] &
+            sex == wle_iter_comb$sex[k]) |>
+          mutate(
+            country_code_3d = as.character(country_code_3d),
+            region = as.character(region),
+            year_binned = as.character(year_binned),
+            sex = as.character(sex)) |>
+          ungroup()
+  
+        # logit scale; predictions on the boundary are moved just inside (0, 1)
+        logit <- function(p) {
+          p <- pmin(pmax(p, 1e-10), 1 - 1e-10)
+          log(p / (1 - p))
+        }
+
+        log_prev  <- logit(comb$prev)
+        log_hours <- logit(comb$hours)
+  
+        # create cumulative rates to guarantee that single years average corresponds to 5-year bin
+        log_prev_cum <- c(0, cumsum(log_prev * 5))
+        log_hours_cum <- c(0, cumsum(log_hours * 5))
+  
+        # fit spline
+        spline_prev <- spline(x = c(50, 55, 60, 65, 70, 75), y = log_prev_cum, method = "natural", n = 26)
+        spline_hours <- spline(x = c(50, 55, 60, 65, 70, 75), y = log_hours_cum, method = "natural", n = 26)
+  
+        # transform back into rates at single ages
+        single_year_prev <- exp(diff(spline_prev$y)) / (1 + exp(diff(spline_prev$y)))
+        single_year_hours <- exp(diff(spline_hours$y)) / (1 + exp(diff(spline_hours$y)))
+  
+        # add back to region-year-sex combination
+        comb <- comb |>
+          expand(country_code_3d = country_code_3d, region = region, year_binned = year_binned, sex = sex, age_bracket = 50:74) |>
+          mutate(prev = single_year_prev, hours = single_year_hours)
+      
+        ungrouped <- rbind(ungrouped, comb)
+      
+      }
+      
+      results_iter <- ungrouped
+      
+    }
+    
+    message(paste("Processing Bootstrap Iteration:", i))
+
+    # add year_binned_region
+    region_keys <- data_stratum |>
+      ungroup() |>
+      select(country_code_3d, region, year_binned, year_binned_region, sex) |>
+      unique() |>
+      mutate(across(c(country_code_3d, region, year_binned, sex), as.character))
+
+    results_iter <- results_iter |>
+      ungroup() |>
+      mutate(
+        across(c(country_code_3d, region, year_binned, sex), as.character),
+        age_bracket  = as.numeric(age_bracket),
+        prev         = as.numeric(prev),
+        hours        = as.numeric(hours),
+        bs_iteration = i) |>
+      left_join(region_keys, by = c("country_code_3d", "region", "year_binned", "sex"))
+
+    stopifnot(!any(is.na(results_iter$year_binned_region)))
+
+    prev_iter <- results_iter |>
+      select(country_code_3d, region, year_binned, year_binned_region, sex,
+             age_bracket, prev, bs_iteration)
+
+    saveRDS(prev_iter, paste0("outputs/bootstraps/emp_", j, "_", i, ".rds"))
+
+    hours_iter <- results_iter |>
+      select(country_code_3d, region, year_binned, year_binned_region, sex,
+             age_bracket, hours, bs_iteration)
+
+    saveRDS(hours_iter, paste0("outputs/bootstraps/hours_", j, "_", i, ".rds"))
+
+  })
+
+  stopCluster(cluster)
+  
+}
+
+```

@@ -1,0 +1,308 @@
+---
+title: '05_decomposition'
+---
+
+```{r setup}
+library(tidyverse)
+library(sf)
+library(furrr)
+library(progressr)
+
+rm(list = ls())
+options(scipen = 999)
+set.seed(123)
+
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r load-data}
+load("outputs/final_estimates.RData")
+
+# 250 bootstrap draws per region
+n_draws <- 250
+
+reindex <- function(x) {
+  x |>
+    group_by(region, sex) |>
+    mutate(bs_draw = dense_rank(bs_iteration)) |>
+    ungroup() |>
+    filter(bs_draw <= n_draws) |>
+    mutate(bs_iteration = bs_draw) |>
+    select(-bs_draw)
+}
+
+# exclude UK (not observed in 2020-24); rows sorted by age
+estimates_emp_rate <- estimates_emp_rate_bs |>
+  filter(country_code_3d != "GBR") |>
+  reindex() |>
+  arrange(region, year_binned, sex, bs_iteration, age) |>
+  select(bs_iteration, region, year_binned, sex, age, emp_rate)
+
+estimates_hours <- estimates_hours_bs |>
+  filter(country_code_3d != "GBR") |>
+  reindex() |>
+  arrange(region, year_binned, sex, bs_iteration, age) |>
+  select(bs_iteration, region, year_binned, sex, age, hours)
+
+stopifnot(
+  n_distinct(estimates_emp_rate$region) ==
+    n_distinct(estimates_emp_rate_bs$region[estimates_emp_rate_bs$country_code_3d != "GBR"]))
+message("decomposing ", n_distinct(estimates_emp_rate$region), " regions")
+
+estimates_survival <- estimates_survival |>
+  filter(country_code_3d != "GBR") |>
+  mutate(surv_prob = ifelse(is.na(surv_prob_regional), surv_prob_national, surv_prob_regional)) |>
+  arrange(region, year_binned, sex, age) |>
+  select(region, year_binned, sex, age, surv_prob)
+
+pop_size <- estimates_combined |>
+  ungroup() |>
+  filter(country_code_3d != "GBR") |>
+  select(region, year_binned, pop_size_regional) |>
+  distinct()
+
+# lookup tables: one age vector per region, period, sex and bootstrap draw
+key4 <- function(region, period, sex, draw) paste(region, period, sex, draw, sep = "\r")
+key3 <- function(region, period, sex)       paste(region, period, sex, sep = "\r")
+
+emp_lookup <- split(
+  estimates_emp_rate$emp_rate,
+  key4(estimates_emp_rate$region, estimates_emp_rate$year_binned,
+       estimates_emp_rate$sex,    estimates_emp_rate$bs_iteration))
+
+hours_lookup <- split(
+  estimates_hours$hours,
+  key4(estimates_hours$region, estimates_hours$year_binned,
+       estimates_hours$sex,    estimates_hours$bs_iteration))
+
+surv_lookup <- split(
+  estimates_survival$surv_prob,
+  key3(estimates_survival$region, estimates_survival$year_binned, estimates_survival$sex))
+
+# population weights (2010-14)
+pop_weight <- pop_size |> filter(year_binned == "2010-14")
+pop_weight <- setNames(pop_weight$pop_size_regional, pop_weight$region)
+
+regions  <- sort(unique(estimates_emp_rate$region))
+bs_iters <- sort(unique(estimates_emp_rate$bs_iteration))
+
+# free memory before starting the workers
+rm(list = intersect(ls(), c("estimates_wle", "estimates_wle_bs",
+                            "estimates_emp_rate_bs", "estimates_hours_bs",
+                            "estimates_combined", "estimates_emp_rate",
+                            "estimates_hours", "estimates_survival", "pop_size")))
+gc()
+
+```
+
+```{r helper-functions}
+
+# combinations of period 1 and period 2 components (E: employment, H: hours, S: survival)
+ORDERS <- c("E1-H1-S1", "E2-H1-S1", "E1-H2-S1", "E1-H1-S2",
+            "E2-H2-S1", "E1-H2-S2", "E2-H1-S2", "E2-H2-S2")
+
+# population-weighted SD
+calc_sd <- function(wle, w) {
+  mu <- sum(w * wle) / sum(w)
+  sqrt(sum(w * (wle - mu)^2) / sum(w))
+}
+
+# WLE for all 8 combinations, one region
+permut_region <- function(reg, sex_s, bs_i, start_period, end_period) {
+
+  E1 <- emp_lookup[[  key4(reg, start_period, sex_s, bs_i)]]
+  E2 <- emp_lookup[[  key4(reg, end_period,   sex_s, bs_i)]]
+  H1 <- hours_lookup[[key4(reg, start_period, sex_s, bs_i)]]
+  H2 <- hours_lookup[[key4(reg, end_period,   sex_s, bs_i)]]
+  S1 <- surv_lookup[[ key3(reg, start_period, sex_s)]]
+  S2 <- surv_lookup[[ key3(reg, end_period,   sex_s)]]
+
+  if (is.null(E1) || is.null(E2) || is.null(H1) || is.null(H2) ||
+      is.null(S1) || is.null(S2)) return(NULL)
+
+  c(sum(E1 * H1 * S1), sum(E2 * H1 * S1), sum(E1 * H2 * S1), sum(E1 * H1 * S2),
+    sum(E2 * H2 * S1), sum(E1 * H2 * S2), sum(E2 * H1 * S2), sum(E2 * H2 * S2))
+}
+
+# stepwise replacement: contribution of E, H, and S averaged over all 6 orderings
+decomp <- function(mat, w) {
+
+  m <- function(ord) calc_sd(mat[, ord], w)
+
+  obs_1 <- m("E1-H1-S1")
+  obs_2 <- m("E2-H2-S2")
+
+  # E contributions
+  E_contrs <- c(
+    m("E2-H1-S1") - obs_1,                 # E->H->S
+    m("E2-H1-S1") - obs_1,                 # E->S->H
+    m("E2-H2-S1") - m("E1-H2-S1"),         # H->E->S
+    obs_2         - m("E1-H2-S2"),          # H->S->E
+    obs_2         - m("E1-H2-S2"),          # S->H->E
+    m("E2-H1-S2") - m("E1-H1-S2")          # S->E->H
+  )
+
+  # H contributions
+  H_contrs <- c(
+    m("E2-H2-S1") - m("E2-H1-S1"),         # E->H->S
+    obs_2         - m("E2-H1-S2"),          # E->S->H
+    m("E1-H2-S1") - obs_1,                 # H->E->S
+    m("E1-H2-S1") - obs_1,                 # H->S->E
+    m("E1-H2-S2") - m("E1-H1-S2"),         # S->H->E
+    obs_2         - m("E2-H1-S2")           # S->E->H
+  )
+
+  # S contributions
+  S_contrs <- c(
+    obs_2         - m("E2-H2-S1"),          # E->H->S
+    m("E2-H1-S2") - m("E2-H1-S1"),         # E->S->H
+    obs_2         - m("E2-H2-S1"),          # H->E->S
+    m("E1-H2-S2") - m("E1-H2-S1"),         # H->S->E
+    m("E1-H1-S2") - obs_1,                 # S->H->E
+    m("E1-H1-S2") - obs_1                  # S->E->H
+  )
+
+  E_contr    <- mean(E_contrs)
+  H_contr    <- mean(H_contrs)
+  S_contr    <- mean(S_contrs)
+  sd_change  <- obs_2 - obs_1
+
+  data.frame(
+    ind = c("sd_start", "sd_end", "sd_change",
+            "E_contr", "E_contr_perc", "H_contr", "H_contr_perc", "S_contr", "S_contr_perc"),
+    value = c(
+      obs_1, obs_2, sd_change,
+      E_contr, E_contr / sd_change * 100,
+      H_contr, H_contr / sd_change * 100,
+      S_contr, S_contr / sd_change * 100
+    )
+  )
+}
+```
+
+```{r decomposition-loop}
+periods <- c("2000-04", "2005-09", "2010-14", "2015-19", "2020-24")
+
+# all combinations of period, sex and bootstrap draw
+grid <- expand.grid(
+  end_period = periods[-1],          # "2005-09" through "2020-24"
+  sex        = c("female", "male"),
+  bs_i       = bs_iters,
+  stringsAsFactors = FALSE
+) |>
+  mutate(start_period = periods[match(end_period, periods) - 1])
+
+options(future.globals.maxSize = 8 * 1024^3)
+
+# number of workers (about 0.5 GB of memory each)
+n_workers <- 50
+allocated <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK")))
+if (!is.na(allocated)) n_workers <- min(n_workers, allocated)
+n_workers <- min(n_workers, parallel::detectCores(logical = FALSE), na.rm = TRUE)
+
+message("using ", n_workers, " workers for ", nrow(grid), " tasks")
+plan(multisession, workers = n_workers)
+
+handlers(handler_progress(
+  format = "[:bar] :current/:total | :message",
+  width  = 80
+))
+
+with_progress({
+
+  p <- progressor(nrow(grid))
+
+  decomp_results_bs <- future_pmap_dfr(
+    grid,
+    function(end_period, sex, bs_i, start_period) {
+
+      p(message = sprintf("%s -> %s | %s | bs %s", start_period, end_period, sex, bs_i))
+
+      # regions x 8 matrix
+      vals <- lapply(regions, permut_region,
+                     sex_s        = sex,
+                     bs_i         = bs_i,
+                     start_period = start_period,
+                     end_period   = end_period)
+
+      ok   <- !vapply(vals, is.null, logical(1))
+      w    <- pop_weight[regions[ok]]
+      ok2  <- !is.na(w)
+
+      mat  <- do.call(rbind, vals[ok][ok2])
+      colnames(mat) <- ORDERS
+
+      result              <- decomp(mat, w[ok2])
+      result$bs_iteration <- bs_i
+      result$sex          <- sex
+      result$period       <- end_period
+      result
+    },
+    .options = furrr_options(seed = TRUE)
+  )
+
+})
+
+plan(sequential)
+```
+
+```{r summarise-results}
+decomp_results <- decomp_results_bs |>
+  group_by(ind, sex, period) |>
+  summarise(
+    est = mean(value,                   na.rm = TRUE),
+    low = quantile(value, 0.025, na.rm = TRUE),
+    upp = quantile(value, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  select(sex, period, ind, est, low, upp)
+```
+
+```{r plot-decomp}
+plot_data <- decomp_results |>
+  filter(ind %in% c("E_contr", "H_contr", "S_contr")) |>
+  mutate(
+    ind = factor(ind,
+                 levels = c("S_contr", "H_contr", "E_contr"),
+                 labels = c("Survival", "Working hours", "Employment participation")),
+    sex = ifelse(sex == "male", "Men", "Women"),
+    period = case_when(
+      period == "2005-09" ~ "2000-04 to\n2005-09",
+      period == "2010-14" ~ "2005-09 to\n2010-14",
+      period == "2015-19" ~ "2010-14 to\n2015-19",
+      period == "2020-24" ~ "2015-19 to\n2020-24",
+      TRUE ~ NA_character_
+    )
+  )
+
+ggplot(plot_data, aes(x = ind, y = est, fill = ind)) +
+  facet_grid(period ~ sex, switch = "y") +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymax = upp, ymin = low), width = 0.2) +
+  geom_hline(yintercept = 0) +
+  coord_flip() +
+  theme_bw() +
+  scale_y_continuous(breaks = seq(-10, 10, 0.05)) +
+  scale_fill_manual(values = c("goldenrod", "firebrick", "navyblue")) +
+  theme(
+    legend.position  = "bottom",
+    axis.ticks.y     = element_blank(),
+    axis.text.y      = element_blank(),
+    axis.text.x      = element_text(size = 11),
+    legend.text      = element_text(size = 12),
+    strip.text       = element_text(size = 14)
+  ) +
+  labs(
+    x    = NULL,
+    y    = "Contribution to Change in Standard Deviation",
+    fill = "Component"
+  )
+ggsave("outputs/figures/fig5_decomp.pdf", width = 6.5, height = 7)
+ggsave("outputs/figures/fig5_decomp.png", width = 6.5, height = 5.5)
+
+```
+
+```{r save-results}
+# save bootstrap results
+save(decomp_results_bs, file = "outputs/decomp_results_bs.RData")
+```

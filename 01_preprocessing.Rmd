@@ -1,0 +1,288 @@
+---
+title: '01_preprocessing'
+---
+
+```{r setup}
+library(tidyverse)
+library(rio)
+library(foreach)
+library(doParallel)
+library(eurostat)
+library(giscoR)
+library(openxlsx)
+
+rm(list = ls())
+
+options(scipen = 999)
+
+```
+
+# load data
+```{r}
+
+data_overview <- import("data/data_lfs/data_lfs_overview.xlsx")
+
+data_overview <- data_overview |> filter(year %in% c(2000:2024))
+
+registerDoParallel(parallel::detectCores() - 1)
+
+data_lfs <- foreach(i = data_overview$path, .combine = rbind) %dopar% {
+  
+  file <- rio::import(paste0(i))
+
+  file <- file |>
+    dplyr::select(COUNTRY, REGION_2D, YEAR, AGE, AGE_GRP, SEX, ILOSTAT, MAINSTAT, EMPSTAT, YEARPR, WANTWORK, WANTREAS, SEEKWORK, SEEKREAS, AVAILBLE, AVAIREAS, LEAVREAS, HWUSUAL, COEFFY, COEFFHH, COEFFMOD) |>
+    dplyr::filter(AGE_GRP %in% c("Y50-54", "Y55-59", "Y60-64", "Y65-69", "Y70-74")) |>
+    dplyr::filter(YEAR %in% c(2000:2024))
+  
+  return(file)
+  
+}
+
+stopImplicitCluster()
+
+rm(data_overview)
+
+```
+
+# create LFS variables
+```{r}
+
+data_lfs <- data_lfs |>
+  mutate(country_code = COUNTRY) |>
+  select(-c("COUNTRY"))
+
+data_lfs <- data_lfs |>
+  mutate(region_original = factor(paste0(country_code, REGION_2D))) |>
+  select(-c("REGION_2D"))
+
+data_lfs <- data_lfs |>
+  mutate(year = YEAR) |>
+  select(-c("YEAR"))
+
+data_lfs <- data_lfs |>
+  mutate(year_binned = case_when(
+    year %in% c(2000:2004) ~ "2000-04",
+    year %in% c(2005:2009) ~ "2005-09",
+    year %in% c(2010:2014) ~ "2010-14",
+    year %in% c(2015:2019) ~ "2015-19",
+    year %in% c(2020:2024) ~ "2020-24"))
+
+data_lfs <- data_lfs |>
+  mutate(age = AGE) |>
+  select(-c("AGE"))
+
+data_lfs <- data_lfs |>
+  mutate(age_bin = AGE_GRP) |>
+  select(-c("AGE_GRP"))
+
+data_lfs <- data_lfs |>
+  mutate(sex = case_when(
+    SEX %in% c(1) ~ "male",
+    SEX %in% c(2) ~ "female")) |>
+  select(-c("SEX"))
+
+data_lfs <- data_lfs |>
+  mutate(lm_status = case_when(
+    EMPSTAT %in% c(1) ~ "employed",
+    EMPSTAT %in% c(2) ~ "not employed",
+    T ~ NA)) |>
+  select(-c("EMPSTAT"))
+
+data_lfs <- data_lfs |>
+  mutate(
+    working_hours = case_when(
+      lm_status %in% c("employed") & !HWUSUAL %in% c(99, 97) ~ HWUSUAL,
+      T ~ NA),
+    working_hours_norm = pmin(working_hours / 40, 1)) |>
+  select(-c("HWUSUAL"))
+
+data_lfs <- data_lfs |>
+  mutate(weight = case_when(
+    !is.na(COEFFY) ~ COEFFY,
+    is.na(COEFFY) & !is.na(COEFFHH) ~ COEFFHH,
+    is.na(COEFFY) & is.na(COEFFHH) & !is.na(COEFFMOD) ~ COEFFMOD,
+    T ~ NA)) |>
+  select(-c("COEFFY", "COEFFHH", "COEFFMOD"))
+
+# select variables and arrange
+data_lfs <- data_lfs |>
+  select(country_code, year, year_binned, region_original, age, age_bin, sex, lm_status, working_hours, working_hours_norm, weight) |>
+  arrange(country_code, region_original, year, age)
+
+```
+
+# clean country names
+```{r}
+data_lfs <- data_lfs |>
+  mutate(
+    country_name = case_when(
+      country_code %in% c("AT") ~ "Austria",
+      country_code %in% c("BE") ~ "Belgium",
+      country_code %in% c("BG") ~ "Bulgaria",
+      country_code %in% c("CH") ~ "Switzerland",
+      country_code %in% c("CY") ~ "Cyprus",
+      country_code %in% c("CZ") ~ "Czechia",
+      country_code %in% c("DE") ~ "Germany",
+      country_code %in% c("DK") ~ "Denmark",
+      country_code %in% c("EE") ~ "Estonia",
+      country_code %in% c("EL") ~ "Greece",
+      country_code %in% c("ES") ~ "Spain",
+      country_code %in% c("FI") ~ "Finland",
+      country_code %in% c("FR") ~ "France",
+      country_code %in% c("HR") ~ "Croatia",
+      country_code %in% c("HU") ~ "Hungary",
+      country_code %in% c("IE") ~ "Ireland",
+      country_code %in% c("IS") ~ "Iceland",
+      country_code %in% c("IT") ~ "Italy",
+      country_code %in% c("LT") ~ "Lithuania",
+      country_code %in% c("LU") ~ "Luxembourg",
+      country_code %in% c("LV") ~ "Latvia",
+      country_code %in% c("NL") ~ "Netherlands",
+      country_code %in% c("NO") ~ "Norway",
+      country_code %in% c("PL") ~ "Poland",
+      country_code %in% c("PT") ~ "Portugal",
+      country_code %in% c("RO") ~ "Romania",
+      country_code %in% c("SE") ~ "Sweden",
+      country_code %in% c("SI") ~ "Slovenia",
+      country_code %in% c("SK") ~ "Slovakia",
+      country_code %in% c("UK") ~ "United Kingdom"),
+    country_code_3d = case_when(
+      country_code %in% c("AT") ~ "AUT",
+      country_code %in% c("BE") ~ "BEL",
+      country_code %in% c("BG") ~ "BGR",
+      country_code %in% c("CH") ~ "CHE",
+      country_code %in% c("CY") ~ "CYP",
+      country_code %in% c("CZ") ~ "CZE",
+      country_code %in% c("DE") ~ "DEU",
+      country_code %in% c("DK") ~ "DNK",
+      country_code %in% c("EE") ~ "EST",
+      country_code %in% c("EL") ~ "GRC",
+      country_code %in% c("ES") ~ "ESP",
+      country_code %in% c("FI") ~ "FIN",
+      country_code %in% c("FR") ~ "FRA",
+      country_code %in% c("HR") ~ "HRV",
+      country_code %in% c("HU") ~ "HUN",
+      country_code %in% c("IE") ~ "IRL",
+      country_code %in% c("IS") ~ "ISL",
+      country_code %in% c("IT") ~ "ITA",
+      country_code %in% c("LT") ~ "LTU",
+      country_code %in% c("LU") ~ "LUX",
+      country_code %in% c("LV") ~ "LVA",
+      country_code %in% c("NL") ~ "NLD",
+      country_code %in% c("NO") ~ "NOR",
+      country_code %in% c("PL") ~ "POL",
+      country_code %in% c("PT") ~ "PRT",
+      country_code %in% c("RO") ~ "ROU",
+      country_code %in% c("SE") ~ "SWE",
+      country_code %in% c("SI") ~ "SVN",
+      country_code %in% c("SK") ~ "SVK",
+      country_code %in% c("UK") ~ "GBR")) |>
+  rename("country_code_2d" = "country_code")
+
+```
+
+# clean region codes
+```{r}
+nuts_harmonised <- import("data/final_nuts_harmonisation.xlsx", sheet = "Sheet1")
+
+nuts_harmonised <- nuts_harmonised |>
+  mutate(
+    region_nuts1 = ifelse(level == "nuts1", region, substr(region, 1, 3)),
+    region_nuts2 = ifelse(level == "nuts2", region, NA)) |>
+  select(region_original, region, region_nuts1, region_nuts2) |>
+  unique()
+
+data_lfs <- data_lfs |> left_join(nuts_harmonised, by = "region_original")
+
+```
+
+```{r}
+# regions combining several NUTS units
+merged_regions <- c("NO08_NO09_NO0A", "PT16_PT18", "FI1B_FI1C")
+
+# region names (NUTS 2021)
+nuts_names <- get_eurostat_geospatial(year = 2021) |>
+  select(NUTS_ID, NAME_LATN) |>
+  rename("region" = "NUTS_ID", "region_name" = "NAME_LATN")
+
+data_lfs <- data_lfs |> left_join(nuts_names, by = "region")
+
+data_lfs <- data_lfs |>
+  mutate(
+    region_nuts1 = ifelse(region %in% merged_regions, NA_character_, as.character(region_nuts1)),
+    region_nuts2 = ifelse(region %in% merged_regions, NA_character_, as.character(region_nuts2)),
+    region_name = case_when(
+      region == "NO08_NO09_NO0A" ~ "Combined Oslo, Agder, and Vestlandet",
+      region == "PT16_PT18"      ~ "Combined Centro and Alentejo",
+      region == "FI1B_FI1C"      ~ "Combined Helsinki and South Finland",
+      .default = str_to_title(as.character(region_name))),
+    region          = factor(region),
+    region_name     = factor(region_name),
+    region_original = factor(region_original))
+
+stopifnot(!any(is.na(data_lfs$region_name)))
+
+```
+
+# sample selection
+```{r}
+data_lfs <- data_lfs |> mutate(year_binned_region = interaction(region, year_binned, drop = TRUE))
+
+# region-sex-period combinations with at least one observation with non-zero weight
+data_include <- data_lfs |>
+  filter(weight != 0) |>
+  select(year_binned, region, sex) |>
+  unique()
+
+data_lfs <- data_lfs |>
+  # filter out region-sex combinations that do not match inclusion criteria
+  semi_join(data_include, by = c("region", "sex", "year_binned")) |>
+  # filter rows with missing values
+   mutate(
+    age_bracket = ifelse(is.na(age), age_bin, age),
+    missing = case_when(
+      if_any(c("country_name", "region", "age_bracket", "year_binned", "sex", "lm_status", "weight"), ~is.na(.)) ~ 1,
+      lm_status == "employed" & is.na(working_hours) ~ 1,
+      T ~ 0))
+
+data_lfs <- data_lfs |> 
+  filter(!region %in% c("NO0", "NO00", "IS", "IS0",
+                        "FRY1", "FRY2", "FRY3", "FRY4", "FRY5", 
+                        "ES6", "ES7", "ES70", "ES63", "ES64",
+                        "PT2", "PT3", "PT20", "PT30")) |>
+  # select variables and arrange rows
+  select(country_name, country_code_2d, country_code_3d, region, region_name, region_original, region_nuts1, region_nuts2, year, year_binned, year_binned_region, age, age_bin, age_bracket, sex, lm_status, working_hours, working_hours_norm, weight, missing) |>
+  arrange(country_name, region_nuts1, year, age_bracket)
+
+# share of observations with missing values
+share_missing <- mean(data_lfs$missing) * 100
+share_missing
+
+```
+
+```{r}
+data_lfs <- data_lfs |> filter(missing == 0) |> select(-missing)
+
+rm(list = setdiff(ls(), c("data_lfs")))
+
+```
+
+# Tab. B1: sample statistics
+```{r}
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+
+tab_b1 <- data_lfs |>
+  filter(!region %in% c("FI1B", "FI1C", "IE04", "IE05", "IE06", "BG3", "BG4", "HU11", "HU12")) |>
+  group_by(country_name) |>
+  summarise(n_regions = n_distinct(region), n_obs = n(), .groups = "drop")
+
+write.xlsx(tab_b1, "outputs/tables/tab_b1_sample.xlsx")
+
+```
+
+# save combined data
+```{r}
+save(data_lfs, file = "data/data_final.RData")
+
+```

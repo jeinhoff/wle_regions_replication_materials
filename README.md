@@ -1,6 +1,6 @@
-# The length of working life in European regions
+# The length of working life in European regions: Disparities, divergence, and convergence between 2000 and 2024
 
-R code for the paper "The length of working life in European regions: Disparities, divergence, and convergence between 2000 and 2024" by Jan Einhoff and Christian Dudel.
+Replication materials for the paper "The length of working life in European regions: Disparities, divergence, and convergence between 2000 and 2024" by Jan Einhoff and Christian Dudel.
 
 ## Code
 
